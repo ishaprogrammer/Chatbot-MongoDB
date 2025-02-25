@@ -4,6 +4,9 @@ from pymongo import MongoClient
 import os
 from groq import Groq
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -182,7 +185,3 @@ async def root():
 # Handler for Vercel deployment
 from mangum import Mangum
 handler = Mangum(app)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
