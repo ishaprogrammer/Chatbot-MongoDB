@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware  
 import uvicorn
 
 # ----------------- Imports -----------------
@@ -35,6 +36,15 @@ collection = db_health["children"]
 
 # Define FastAPI app
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (replace with specific origins in production)
+    allow_credentials=True,  # Allows cookies and credentials
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 
 # Define request and response models
 class QueryRequest(BaseModel):
