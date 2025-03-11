@@ -1,31 +1,42 @@
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
+
+# ----------------- Imports -----------------
 import h5py
 from pymongo import MongoClient
 import random
 import numpy as np
 from rapidfuzz import process, fuzz
 from groq import Groq
-# Add to your imports at the top
-from fastapi import FastAPI, Depends, HTTPException
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
-import uvicorn
-import uuid
-from fastapi.middleware.cors import CORSMiddleware
+from config import health_issues, session_memory, synonyms, refund_policy
 import os
+from dotenv import load_dotenv
+from functools import lru_cache
+import time
+import re
 
-# Create FastAPI app
-app = FastAPI(title="Health Recommendations API")
+# ----------------- Global Variables and Initializations -----------------
+load_dotenv()
+mongodb_client = MongoClient(os.getenv("MONGODB_URI"))
+db = mongodb_client['ChatBot']
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+conversation_history = []
+final_conversation_history = []
+parent_data_cache = {}
+children_data_cache = {}
+data_loaded = False
+client = MongoClient(os.getenv("MONGODB_URI"))
+db_health = client["ChatBot"]
+collection = db_health["children"]
 
-# Add CORS middleware to allow cross-origin requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
+#------------------FastAPI setup--------------------------------
 
-# Create request and response models
+# Define FastAPI app
+app = FastAPI()
+
+# Define request and response models
 class QueryRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
@@ -33,99 +44,32 @@ class QueryRequest(BaseModel):
 class QueryResponse(BaseModel):
     response: str
     session_id: str
-
-# Initialize app data at startup
-@app.on_event("startup")
-async def startup_event():
-    global recommendations, product_cache
     
-    # Load recommendations from the HDF5 file
-    recommendations = load_recommendations_from_h5('recommendations.h5')
-    
-    # Connect to MongoDB
-    client = MongoClient(os.getenv("MONGODB_URI"))
-    db = client["ChatBot"]
-    collection = db["children"]
-    
-    # Preload all product details
-    product_cache = preload_all_product_details()
-
 @app.get("/")
 async def root():
     return {"message": "Health Chatbot API is running. Send POST requests to /chat endpoint."}
 
-# Define API endpoints
+# Define the /chat endpoint
 @app.post("/chat", response_model=QueryResponse)
-async def process_query(request: QueryRequest):
-    # Generate a session ID if not provided
-    session_id = request.session_id or str(uuid.uuid4())
-    
-    # Process the query
-    response = process_input_with_memory(request.query, session_id, product_cache)
-    
-    return {"response": response, "session_id": session_id}
+async def chat(request: QueryRequest):
+    """
+    Endpoint to handle user queries.
+    """
+    try:
+        # Use the provided session_id or default to "default_session" if not provided
+        session_id = request.session_id if request.session_id else "default_session"
+
+        # Process the user input using the existing logic
+        response = process_user_input(request.query, session_id)
+
+        # Return the response along with the session_id
+        return QueryResponse(response=response, session_id=session_id)
+    except Exception as e:
+        # Handle any errors and return a 500 status code with the error message
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-#########################################
-# STEP 1: UTILITY FUNCTIONS AND SETUP
-#########################################
-
-# Dictionary mapping keywords to product IDs
-keyword_to_parent_ids = {
-    "combo": ["COMBARNYARD001", "COMBPROSO001", "COMBFINGER001", "COMBMILLET001"],
-    "dry fruits": ["DRYFRUITS001"],
-    "flour": ["FLOURGRAIN001", "BLACKWHEATFLOUR001", "LITTLEFLOUR001", "FOXTAILFLOUR001", "BARNYARDFLOUR001", "KODOFLOUR001", "MIXEDFLOUR001", "BROWNTOPFLOUR001", "RAGIFLOUR001"],
-    "rice": ["BLACKRICE001", "DARKBROWNRICE001", "BROWNRICE001", "MILLETRICE001"],
-    "wheat": ["WHEAT001"],
-    "offer": ["COMBARNYARD001", "COMBPROSO001", "COMBFINGER001", "COMBMILLET001"],
-    "black rice": ["BLACKRICE001"],
-    "brown rice": ["BROWNRICE001"],
-    "dark brown rice": ["DARKBROWNRICE001"],
-    "millet rice": ["MILLETRICE001"],
-    "black wheat flour": ["BLACKWHEATFLOUR001"],
-    "little millet flour": ["LITTLEFLOUR001"],
-    "foxtail millet flour": ["FOXTAILFLOUR001"],
-    "Barnyard millet flour": ["BARNYARDFLOUR001"],
-    "kodo millet flour": ["KODOFLOUR001"],
-    "Browntop millet flour": ["BROWNTOPFLOUR001"],
-    "mixed millet flour": ["MIXEDFLOUR001"],
-    "ragi millet flour": ["RAGIFLOUR001"]
-}
-
-# List of health issues for matching
-health_issues = [
-    "dialysis", "albumin urea", "gout", "diabetes", "thyroid", "p.c.o.d", "hormonals imbalance",
-    "endometriosis", "fibroid", "b.p", "heart related", "cholesterol", "triglycerides",
-    "angina pectoris", "obesity / weight loss", "weight gain (underweight)", "asthma", "t.b.",
-    "pneumonia", "sinusitis", "respiratory related issues", "parkinson's", "fits", "paralysis",
-    "kidney stones", "gall bladder stones", "pancreas stones", "gastric problems", "acidity",
-    "gerd", "eye problems", "glaucoma", "liver", "kidney", "pancreas", "hepatitis a and b",
-    "nervous problems", "vertigo and migraine", "sweating in palm/feet", "snoring", "stammering",
-    "tachy cardia", "after heart attack", "hole in the heart", "c4, c5", "l4, l5", "sciatica",
-    "varicose veins", "varicocele", "hydrocele", "increasing platelets", "dengue fever",
-    "decreasing platelets", "decreasing wbc", "infertility", "increasing sperm count",
-    "constipation", "piles", "fistula", "fissures", "urine infection", "prostate (men)", "hiv",
-    "skin problems", "psoriasis", "eczema dry/weeping", "vitiligo", "ichthyosis", "e.s.r",
-    "urticaria", "i.b.s", "colitis", "crohn's disease", "anemia", "dental problems", "gum problems",
-    "bleeding gums", "gums pain", "tooth pain", "lupus", "chikungunya", "h1 n1", "h5 n1",
-    "viral fevers: malaria, typhoid", "fatty liver", "spleen", "pancreatitis", "differently abled",
-    "autism", "cerebral palsy", "polio", "physically disabled", "after delivery", "during pregnancy"
-]
-
-# Synonyms for health issues
-synonyms = {
-    "diabetic": "diabetes",
-    "bp": "b.p"
-}
-
-# Add session-based memory
-session_memory = {}
-
-#########################################
-# STEP 2: DATA LOADING FUNCTIONS
-#########################################
-
- 
+# ----------------- Health Issue Code Functions -----------------
 def load_recommendations_from_h5(file_path):
     """Load health recommendations from HDF5 file"""
     recommendations = {}
@@ -149,7 +93,6 @@ def load_recommendations_from_h5(file_path):
             recommendations[health_issue] = load_group(h5file[health_issue], health_issue + '/')
     return recommendations
 
- 
 def preload_all_product_details():
     """Preload all product details from MongoDB to reduce query time"""
     product_cache = {}
@@ -160,10 +103,6 @@ def preload_all_product_details():
         if "ids" in data:
             all_parent_ids.update(data["ids"])
     
-    # Add parent_ids from keywords
-    for keyword, parent_ids in keyword_to_parent_ids.items():
-        all_parent_ids.update(parent_ids)
-    
     # Fetch all products for these parent IDs at once
     for parent_id in all_parent_ids:
         products = list(collection.find(
@@ -172,35 +111,6 @@ def preload_all_product_details():
         ))
         product_cache[parent_id] = products
     return product_cache
-
-#########################################
-# STEP 3: INPUT EXTRACTION FUNCTIONS
-#########################################
-
- 
-def extract_keyword(user_input):
-    """Extract product keyword from user input"""
-    input_lower = user_input.lower()
-    
-    # List of specific keywords to check first (in order of priority)
-    specific_keywords = [
-        "black rice", "brown rice", "dark brown rice", "millet rice", "black wheat flour",
-        "little millet flour", "foxtail millet flour", "Barnyard millet flour",
-        "kodo millet flour", "Browntop millet flour", "mixed millet flour", "ragi millet flour",
-    ]
-    
-    # Check for specific keywords first
-    for keyword in specific_keywords:
-        if keyword in input_lower:
-            return keyword
-    
-    # Check for broader keywords if no specific keyword is found
-    broader_keywords = ["rice", "flour", "wheat", "dry fruits", "combo", "offer"]
-    for keyword in broader_keywords:
-        if keyword in input_lower:
-            return keyword
-    
-    return None  # No keyword found
 
  
 def extract_health_issue(user_input):
@@ -222,10 +132,8 @@ def extract_health_issue(user_input):
     if result:
         best_match, score, _ = result
         return best_match if score >= 50 else None
-
     return None
 
- 
 def determine_filter_info(user_input):
     """Determine what information to filter based on user input"""
     user_input_lower = user_input.lower()
@@ -234,17 +142,10 @@ def determine_filter_info(user_input):
         filter_info.append("decoctions")
     if "more" in user_input_lower or "additional" in user_input_lower:
         filter_info.append("more")
-    if "millets" in user_input_lower:
-        filter_info.append("millets")
     if "products" in user_input_lower or "recommended" in user_input_lower:
         filter_info.append("products")
     return filter_info if filter_info else None
 
-#########################################
-# STEP 4: DATA FETCHING FUNCTIONS
-#########################################
-
- 
 def fetch_product_details(parent_ids, product_cache):
     """Get product details from the preloaded cache"""
     product_details = {}
@@ -252,7 +153,7 @@ def fetch_product_details(parent_ids, product_cache):
         products = product_cache.get(parent_id, [])
         if products:
             # Randomly select 2 products (or fewer if there aren't enough)
-            selected_products = random.sample(products, min(1, len(products)))
+            selected_products = random.sample(products, min(2, len(products)))
             product_details[parent_id] = [
                 {
                     "Product Title": product["Product Title"],
@@ -264,61 +165,14 @@ def fetch_product_details(parent_ids, product_cache):
                 for product in selected_products
             ]
         else:
+            print("no products found")
             product_details[parent_id] = []  # No products found for this Parent_id
     return product_details
 
- 
-def fetch_products_for_keyword(keyword, product_cache):
-    """Fetch product details for the keyword's parent_ids, ensuring min 1 and max 3 products."""
-    parent_ids = keyword_to_parent_ids.get(keyword, [])
-    if not parent_ids:
-        return {}, []  # Return empty dict and list if no parent_ids are found
-    
-    # Create a product_details dictionary similar to fetch_product_details
-    product_details = {}
-    all_selected_products = []
-    
-    for parent_id in parent_ids:
-        if len(all_selected_products) >= 3:  # Stop if already 3 products are selected
-            break
-        
-        products = product_cache.get(parent_id, [])
-        if products:
-            # Calculate how many more products can be added without exceeding the max
-            remaining_slots = 3 - len(all_selected_products)
-            
-            # Ensure at least 1 product and at most `remaining_slots` are selected per parent ID
-            sample_size = min(max(1, len(products)), remaining_slots)
-            selected_products = random.sample(products, sample_size)
-            
-            # Format products with Link field for replace_links_with_details function
-            formatted_products = []
-            for product in selected_products:
-                # Create a formatted product dictionary
-                formatted_product = {
-                    "Product Title": product["Product Title"],
-                    "Price": product["Price"],
-                    "Size": product["Size"],
-                    "Link": product["Link"],  
-                    "Link_value": product["Link_value"]
-                }
-                formatted_products.append(formatted_product)
-                all_selected_products.append(formatted_product)
-            
-            product_details[parent_id] = formatted_products
-        else:
-            product_details[parent_id] = []
-    
-    # Ensure at least 1 product is returned
-    if not all_selected_products:
-        return {}, []  # No products found
-    
-    return product_details, all_selected_products
 
  
 def get_millet_name_from_id(parent_id):
     """Convert parent_id to millet name"""
-    # This is a mapping you need to define
     id_to_name = {
         "BROWNTOPMILLET001": "Brown Top Millet",
         "FOXTAILMILLET001": "Foxtail Millet",
@@ -326,13 +180,8 @@ def get_millet_name_from_id(parent_id):
         "LITTLEMILLET001": "Little Millet",
         "KODOMILLET001": "Kodo Millet",
         "BARNTARDMILLET001": "Barnyard Millet",
-        # Add more mappings as needed
     }
     return id_to_name.get(parent_id, parent_id)  # Fall back to ID if no mapping
-
-#########################################
-# STEP 5: RESPONSE GENERATION FUNCTIONS
-#########################################
 
  
 def get_response(health_issue, filter_info=None):
@@ -434,7 +283,6 @@ def get_specific_remedy_info(health_issue, remedy_type):
     
     return response
 
- 
 def send_to_groq(content):
     """Send content to Groq LLM for natural language generation"""
     # Initialize Groq client
@@ -488,11 +336,6 @@ def replace_links_with_details(llm_response, product_details):
     
     return llm_response
 
-#########################################
-# STEP 6: SESSION MANAGEMENT FUNCTIONS
-#########################################
-
- 
 def get_session_memory(session_id):
     """Get or create session memory for a user"""
     if session_id not in session_memory:
@@ -520,9 +363,6 @@ def determine_filter_info(user_input):
     
     filter_info = []
     
-    # Basic filters
-    if any(word in user_input for word in ["millet", "grain"]):
-        filter_info.append("millets")
     if any(word in user_input for word in ["product", "buy", "purchase"]):
         filter_info.append("products")
     
@@ -537,40 +377,6 @@ def determine_filter_info(user_input):
         filter_info.append("more")
     
     return filter_info if filter_info else None
-
-
-#########################################
-# STEP 7: MAIN PROCESSING FUNCTIONS
-#########################################
-
- 
-def process_keyword_request(keyword, user_input, session_id, product_cache):
-    """Handle requests related to product keywords using LLM with link replacement."""
-    # Fetch products for the keyword
-    product_details, all_products = fetch_products_for_keyword(keyword, product_cache)
-    if not all_products:
-        return f"No products found for {keyword}."
-    
-    # Construct content for LLM introduction
-    llm_intro = f"Here are the different types of {keyword.capitalize()} available:\n"
-    
-    # Construct the product list manually for consistency
-    product_list = ""
-    for index, product in enumerate(all_products, start=1):
-        product_list += (
-            f"{index}. {product['Product Title']}\n"
-            f"   - Price: ₹{product['Price']} for {product['Size']}\n"
-            f"   - Link: <{product['Link_value']}>\n\n"
-        )
-    
-    # Combine the introduction and the product list
-    final_response = llm_intro + product_list
-    
-    # Update session memory with the new interaction (don't update health issue)
-    update_session_memory(session_id, user_input, final_response)
-    
-    return final_response
-
  
 def process_health_issue_request(health_issue, user_input, session_id, product_cache):
     """Handle requests related to health issues"""
@@ -631,13 +437,13 @@ def process_remedy_request(remedy_type, user_input, session_id):
 
  
 def detect_remedy_type(user_input):
-    """Detect the type of remedy being requested"""
+    """Detect the type of remedy being requested."""
     user_input_lower = user_input.lower()
-    if "decoction" in user_input_lower:
+    if "decoction" in user_input_lower or "decoctions" in user_input_lower:
         return "decoctions"
-    elif "juice" in user_input_lower:
+    elif "juice" in user_input_lower or "juices" in user_input_lower:
         return "juices"
-    elif "oil" in user_input_lower:
+    elif "oil" in user_input_lower or "oils" in user_input_lower:
         return "oils"
     return None
 
@@ -650,32 +456,13 @@ def process_input_with_memory(user_input, session_id, product_cache):
         return "You can contact on these details number 24/7:\nNumber: +918368200877\nEmail:khadar.group2021@gmail.com"
     
     elif "refund policy" in user_input.lower():
-        return """Food Product Return Policy for Khadar Groups:
-
-At Khadar Groups, we value your satisfaction and aim to provide the highest quality gourmet products. Our Food Product Return Policy is designed to address any concerns you may have regarding your purchase:
-
-Eligibility for Returns:
-Returns are accepted within 14 days of receiving your order.
-
-Condition of Returned Items:
-Returned food products must be unopened, unused, and in their original packaging.
-
-Perishable Goods:
-Perishable items, such as fresh produce or dairy, are non-returnable for safety and hygiene reasons.
-
-Quality Concerns:
-If you receive a damaged or defective food product, please contact us within 48 hours of delivery with supporting images, and we will gladly assist you."""
+        return refund_policy
     
     
     # Check for remedy-specific requests first
     remedy_type = detect_remedy_type(user_input)
     if remedy_type:
         return process_remedy_request(remedy_type, user_input, session_id)
-    
-    # Extract keyword from user input
-    keyword = extract_keyword(user_input)
-    if keyword:
-        return process_keyword_request(keyword, user_input, session_id, product_cache)
     
     # Extract health issue from user input
     health_issue = extract_health_issue(user_input)
@@ -696,10 +483,6 @@ If you receive a damaged or defective food product, please contact us within 48 
     
     return "Please specify a health issue or a product category from the list."
 
-#########################################
-# STEP 8: PROGRAM EXECUTION
-#########################################
-
 # Load recommendations from the HDF5 file
 recommendations = load_recommendations_from_h5('recommendations.h5')
 
@@ -716,7 +499,373 @@ def process_with_timing(query, session_id):
     result = process_input_with_memory(query, session_id, product_cache)
     return result
 
-# Modify your main function to run the FastAPI app
+# ----------------- General Query Code Functions -----------------
+def load_all_data():
+    """Load all needed data into memory once"""
+    global parent_data_cache, children_data_cache, data_loaded
+    
+    if data_loaded:
+        return
+    
+    # Fetch all parent documents with projection to reduce memory usage
+    parent_collection = db['parent']
+    parents = list(parent_collection.find({}, {
+        "_id": 0, 
+        "Parent_id": 1, 
+        "Category": 1, 
+        "Medical Features": 1, 
+        "Tags": 1, 
+        "Nutritional Info": 1
+    }))
+    
+    # Index parents by ID for fast lookup
+    for parent in parents:
+        parent_id = parent["Parent_id"]
+        parent_data_cache[parent_id] = parent
+    
+    # Fetch all children documents with needed fields
+    children_collection = db['children']
+    children = list(children_collection.find({}, {"_id": 0}))
+    
+    # Group children by parent_id
+    for child in children:
+        parent_id = child.get("Parent_id")
+        if parent_id:
+            if parent_id not in children_data_cache:
+                children_data_cache[parent_id] = []
+            children_data_cache[parent_id].append(child)
+    
+    data_loaded = True
+
+@lru_cache(maxsize=1)
+def read_system_message(file_path):
+    """Cache the system message to avoid repeated file reads"""
+    start_time = time.time()
+    try:
+        with open(file_path, 'r') as file:
+            result = file.read().strip()
+    except FileNotFoundError:
+        result = "Default system message: I'm a helpful assistant."
+    end_time = time.time()
+    return result
+
+def parse_values(text):
+    """Parse comma-separated values"""
+    return [value.strip() for value in text.split(',')]
+
+def filter_parents_in_memory(assistant_response):
+    matching_parent_ids = []
+    category_values = []
+    medical_features = []
+    tags = []
+    nutritional_info = []
+    
+    # Extract search criteria from assistant response
+    if "Category:" in assistant_response:
+        category_text = assistant_response.split("Category:")[1].strip().split('\n')[0]
+        category_values = parse_values(category_text)
+    
+    if "Medical Features:" in assistant_response:
+        medical_text = assistant_response.split("Medical Features:")[1].strip().split('\n')[0]
+        medical_features = parse_values(medical_text)
+    
+    if "Tags:" in assistant_response:
+        tags_text = assistant_response.split("Tags:")[1].strip().split('\n')[0]
+        tags = parse_values(tags_text)
+    
+    if "Nutritional Info:" in assistant_response:
+        nutritional_text = assistant_response.split("Nutritional Info:")[1].strip().split('\n')[0]
+        nutritional_info = parse_values(nutritional_text)
+    
+    # Filter parents based on criteria
+    for parent_id, parent in parent_data_cache.items():
+        # Check if parent matches any category
+        category_match = False
+        if category_values:
+            parent_category = parent.get("Category", "")
+            for category in category_values:
+                if category.lower() in parent_category.lower():
+                    category_match = True
+                    break
+        else:
+            category_match = True  # No category filter specified
+        
+        if not category_match:
+            continue
+        
+        # Check for additional criteria
+        other_match = True
+        
+        # Check medical features
+        if medical_features and other_match:
+            parent_medical = parent.get("Medical Features", "")
+            med_match = False
+            for feature in medical_features:
+                if feature.lower() in parent_medical.lower():
+                    med_match = True
+                    break
+            other_match = med_match
+        
+        # Check tags
+        if tags and other_match:
+            parent_tags = parent.get("Tags", "")
+            tags_match = False
+            for tag in tags:
+                if tag.lower() in parent_tags.lower():
+                    tags_match = True
+                    break
+            other_match = tags_match
+        
+        # Check nutritional info
+        if nutritional_info and other_match:
+            parent_nutrition = parent.get("Nutritional Info", "")
+            nutrition_match = False
+            for info in nutritional_info:
+                if info.lower() in parent_nutrition.lower():
+                    nutrition_match = True
+                    break
+            other_match = nutrition_match
+        
+        # If parent matches all criteria, add to results
+        if category_match and other_match:
+            matching_parent_ids.append(parent_id)
+            
+            # Limit to 6 parents
+            if len(matching_parent_ids) >= 6:
+                break
+    
+    return matching_parent_ids
+
+def get_children_for_parents(parent_ids, limit=6):
+    
+    children_data = []
+    link_map = {}  # Dictionary to store Link -> Link_value mapping
+    
+    for parent_id in parent_ids:
+        if parent_id in children_data_cache:
+            children_data.extend(children_data_cache[parent_id])
+            
+            # Limit total children
+            if len(children_data) >= limit:
+                children_data = children_data[:limit]
+                break
+    
+    # Clean the data (remove images, links) but save the link values for later
+    cleaned_children_data = []
+    for item in children_data:
+        # Save the link value before removing it
+        if "Link" in item and "Link_value" in item:
+            link_map[item["Link"]] = item["Link_value"]
+        
+        # Make a copy to avoid modifying the original
+        cleaned_item = item.copy()
+        
+        # Explicitly remove any "Images" key if it exists
+        if "Images" in cleaned_item:
+            del cleaned_item["Images"]
+        
+        # Explicitly remove the "Link_value" key if it exists
+        if "Link_value" in cleaned_item:
+            del cleaned_item["Link_value"]
+        
+        # Look for any fields containing image URLs
+        for key in list(cleaned_item.keys()):
+            if isinstance(cleaned_item[key], str) and (
+                "http" in cleaned_item[key] and any(ext in cleaned_item[key].lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+            ):
+                # If the field appears to be solely an image URL, remove it
+                if key.lower() in ['image', 'images', 'img', 'thumbnail', 'photo']:
+                    del cleaned_item[key]
+        
+        cleaned_children_data.append(cleaned_item)
+    return cleaned_children_data, link_map
+
+def replace_link_placeholders(response_text, link_map):
+    """Replace [Link-X] placeholders with actual link values, and handle entire response being Link-X"""
+    # Check if the entire response is Link-X
+    entire_link_pattern = r'^Link-(\d+)$'
+    entire_match = re.match(entire_link_pattern, response_text.strip())
+    if entire_match:
+        link_id = f"Link-{entire_match.group(1)}"
+        if link_id in link_map:
+            return link_map[link_id]
+        else:
+            return response_text  # If link not found, return original
+    
+    # Otherwise, replace [Link-X] placeholders within the text
+    link_pattern = r'\[Link-(\d+)\]'
+    matches = re.findall(link_pattern, response_text)
+    
+    modified_response = response_text
+    for match in matches:
+        link_id = f"Link-{match}"
+        placeholder = f"[{link_id}]"
+        if link_id in link_map:
+            actual_link = link_map[link_id]
+            modified_response = modified_response.replace(placeholder, actual_link)
+    
+    return modified_response
+
+def process_with_groq(user_input, system_message):
+    """Process user input with Groq model and return response"""
+    total_start_time = time.time()
+    try:
+        global conversation_history, final_conversation_history
+        
+        # Ensure data is loaded
+        if not data_loaded:
+            load_all_data()
+        if not system_message:
+            system_message = read_system_message("keys.txt")
+        
+        # Add user input to both conversation histories
+        conversation_history.append({"role": "user", "content": user_input})
+        final_conversation_history.append({"role": "user", "content": user_input})
+        
+        initial_messages = [
+            {"role": "system", "content": system_message}
+        ] + conversation_history
+        
+         # Debug: Log the initial messages being sent to the LLM
+        print("Debug: Initial Messages Sent to LLM:")
+        for msg in initial_messages:
+            print(f"{msg['role'].capitalize()}: {msg['content']}")
+        
+        response = groq_client.chat.completions.create(
+            model="qwen-2.5-32b",
+            messages=initial_messages,
+            temperature=0.0,
+            max_tokens=1024
+        )
+        
+        assistant_response = response.choices[0].message.content
+        conversation_history.append({"role": "assistant", "content": assistant_response})
+        
+        matching_parent_ids = filter_parents_in_memory(assistant_response)
+        
+        # Get children data from memory and link map
+        children_data, link_map = get_children_for_parents(matching_parent_ids) if matching_parent_ids else ([], {})
+        
+        enhanced_system_message = """You are a helpful medical assistant that provides product suggestions based on the available products data but if no data is provided then answer from your side DONT USE below FORMAT.
+            Only use "₹" sign for prices.
+            If user talks in Hindi, respond in Hindi but in English script.
+            Do not create your own links, just provide link from the data.
+            Recommend min 1 and max 3 products from the provided data(if provided otherwise dont recommend any product).
+            Response should be to the point and concise, also don't mention unnecessary info or comments.
+            Please analyze the product information and provide clear recommendations in a proper format including:
+            1. Product names
+               - Prices
+               - Sizes
+               - [Link]
+               
+            Available Product Data:
+            """
+        
+        # Prepare product data string efficiently
+        product_data_str = "\n".join(str(child) for child in children_data)
+        enhanced_system_message += product_data_str
+        
+        modified_user_input = f"{user_input} (response should be in proper format and easy to read. Respond like you're assisting)"
+        conversation_history.append({"role": "user", "content": modified_user_input})
+
+        # Use final_conversation_history for the second API call
+        final_messages = [
+            {"role": "system", "content": enhanced_system_message}
+        ] + final_conversation_history
+        
+         # Debug: Log the final messages being sent to the LLM
+        print("Debug: Final Messages Sent to LLM:")
+        for msg in final_messages:
+            print(f"{msg['role'].capitalize()}: {msg['content']}")
+        
+        final_response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-specdec",
+            messages=final_messages,
+            temperature=0.0,
+            max_tokens=1024
+        )
+        
+        l_assistant_response = final_response.choices[0].message.content
+        
+        final_assistant_response = replace_link_placeholders(l_assistant_response, link_map)
+        
+        conversation_history.append({"role": "assistant", "content": final_assistant_response})
+        # Add the raw LLM response to final_conversation_history
+        final_conversation_history.append({"role": "assistant", "content": l_assistant_response})
+
+        return final_assistant_response
+    
+    except Exception as e:
+        total_end_time = time.time()
+        print(f"Error occurred. Total processing time: {total_end_time - total_start_time:.4f} seconds")
+        raise Exception(f"Error: {str(e)}")
+    
+def chat_endpoint(message):
+    system_message = read_system_message("keys.txt")
+    response = process_with_groq(message, system_message)
+    return {"response": response}
+
+recommendations = load_recommendations_from_h5('recommendations.h5')
+product_cache = preload_all_product_details()
+load_all_data()
+# ----------------- Routing Logic -----------------
+def detect_health_keywords(user_input):
+    """Detect health-related keywords or remedy keywords in the user's input."""
+    input_lower = user_input.lower()
+    
+    # Check for health issues and their synonyms
+    for keyword in health_issues:
+        if keyword.lower() in input_lower:
+            return True
+    
+    # Check synonyms and map them to actual health issues
+    for synonym, actual_issue in synonyms.items():
+        if synonym.lower() in input_lower:
+            return True
+    
+    # Check for remedy keywords
+    remedy_keywords = ["decoction", "decoctions", "juice", "juices", "oil", "oils"]
+    for keyword in remedy_keywords:
+        if keyword in input_lower:
+            return True
+    
+    # If no health issue or remedy keyword is found, return False
+    return False
+
+def check_specific_health_issue(user_input):
+    """Check if user input contains a specific health issue from the health_issues list or its synonyms."""
+    input_lower = user_input.lower()
+    
+    # First check for exact matches in health_issues
+    for issue in health_issues:
+        if issue.lower() in input_lower:
+            return True, issue
+    
+    # Check for synonyms and return the actual health issue if found
+    for synonym, actual_issue in synonyms.items():
+        if synonym.lower() in input_lower:
+            return True, actual_issue
+    
+    return False, None
+
+def process_user_input(user_input, session_id):
+    """Main entry point for processing user input."""
+    # First, check if input contains a specific health issue or synonym
+    has_specific_issue, issue = check_specific_health_issue(user_input)
+    
+    if has_specific_issue:
+        # If we found a specific health issue or its synonym, process with health issue code
+        return process_input_with_memory(user_input, session_id, product_cache)
+    elif detect_health_keywords(user_input):
+        # If no specific health issue was found but there are general health keywords,
+        # still process with health issue code
+        return process_input_with_memory(user_input, session_id, product_cache)
+    else:
+        # If no health-related content is found, proceed with general query code
+        system_message = read_system_message("keys.txt")
+        return process_with_groq(user_input, system_message)
+
+# ----------------- Main Loop -----------------
+# Run the FastAPI app
 if __name__ == "__main__":
-    # Run the FastAPI app with uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
