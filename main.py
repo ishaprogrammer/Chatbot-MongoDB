@@ -78,7 +78,6 @@ async def chat(request: QueryRequest):
         # Handle any errors and return a 500 status code with the error message
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ----------------- Health Issue Code Functions -----------------
 def load_recommendations_from_h5(file_path):
     """Load health recommendations from HDF5 file"""
@@ -525,7 +524,9 @@ def load_all_data():
         "Category": 1, 
         "Medical Features": 1, 
         "Tags": 1, 
-        "Nutritional Info": 1
+        "Nutritional Info": 1,
+        "Usage": 1,  
+        "Benefits": 1 
     }))
     
     # Index parents by ID for fast lookup
@@ -564,7 +565,7 @@ def parse_values(text):
     return [value.strip() for value in text.split(',')]
 
 def filter_parents_in_memory(assistant_response):
-    matching_parent_ids = []
+    matching_parents = []  # Changed to store full parent data
     category_values = []
     medical_features = []
     tags = []
@@ -638,20 +639,20 @@ def filter_parents_in_memory(assistant_response):
         
         # If parent matches all criteria, add to results
         if category_match and other_match:
-            matching_parent_ids.append(parent_id)
+            matching_parents.append(parent)  # Store full parent data
             
             # Limit to 6 parents
-            if len(matching_parent_ids) >= 6:
+            if len(matching_parents) >= 6:
                 break
     
-    return matching_parent_ids
+    return matching_parents
 
-def get_children_for_parents(parent_ids, limit=6):
-    
+def get_children_for_parents(parents, limit=6):
     children_data = []
     link_map = {}  # Dictionary to store Link -> Link_value mapping
     
-    for parent_id in parent_ids:
+    for parent in parents:
+        parent_id = parent["Parent_id"]
         if parent_id in children_data_cache:
             children_data.extend(children_data_cache[parent_id])
             
@@ -688,7 +689,7 @@ def get_children_for_parents(parent_ids, limit=6):
                     del cleaned_item[key]
         
         cleaned_children_data.append(cleaned_item)
-    return cleaned_children_data, link_map
+    return cleaned_children_data, link_map, parents  # Return parents along with children data
 
 def replace_link_placeholders(response_text, link_map):
     """Replace [Link-X] placeholders with actual link values, and handle entire response being Link-X"""
@@ -716,6 +717,22 @@ def replace_link_placeholders(response_text, link_map):
     
     return modified_response
 
+def contains_product_recommendations(response):
+    """Check if the response contains product recommendations."""
+    # Define flexible patterns that indicate product recommendations
+    product_patterns = [
+        r"\d+\.\s",  # Matches numbered lists (e.g., "1. Product Name")
+        r"₹\d+",     # Matches prices (e.g., "₹1,250.00")
+        r"https?://", # Matches URLs (e.g., "https://example.com")
+        r"Pack\s*-\s*₹", # Matches product packs (e.g., "5kg Pack - ₹1,250.00")
+    ]
+    
+    # Check if any pattern matches the response
+    for pattern in product_patterns:
+        if re.search(pattern, response):
+            return True
+    return False
+
 def process_with_groq(user_input, system_message):
     """Process user input with Groq model and return response"""
     total_start_time = time.time()
@@ -736,11 +753,6 @@ def process_with_groq(user_input, system_message):
             {"role": "system", "content": system_message}
         ] + conversation_history
         
-         # Debug: Log the initial messages being sent to the LLM
-        print("Debug: Initial Messages Sent to LLM:")
-        for msg in initial_messages:
-            print(f"{msg['role'].capitalize()}: {msg['content']}")
-        
         response = groq_client.chat.completions.create(
             model="qwen-2.5-32b",
             messages=initial_messages,
@@ -751,10 +763,10 @@ def process_with_groq(user_input, system_message):
         assistant_response = response.choices[0].message.content
         conversation_history.append({"role": "assistant", "content": assistant_response})
         
-        matching_parent_ids = filter_parents_in_memory(assistant_response)
+        matching_parents = filter_parents_in_memory(assistant_response)
         
         # Get children data from memory and link map
-        children_data, link_map = get_children_for_parents(matching_parent_ids) if matching_parent_ids else ([], {})
+        children_data, link_map, parents = get_children_for_parents(matching_parents) if matching_parents else ([], {}, [])
         
         enhanced_system_message = """You are a helpful medical assistant that provides product suggestions based on the available products data but if no data is provided then answer from your side DONT USE below FORMAT.
             Only use "₹" sign for prices.
@@ -783,11 +795,6 @@ def process_with_groq(user_input, system_message):
             {"role": "system", "content": enhanced_system_message}
         ] + final_conversation_history
         
-         # Debug: Log the final messages being sent to the LLM
-        print("Debug: Final Messages Sent to LLM:")
-        for msg in final_messages:
-            print(f"{msg['role'].capitalize()}: {msg['content']}")
-        
         final_response = groq_client.chat.completions.create(
             model="llama-3.3-70b-specdec",
             messages=final_messages,
@@ -798,6 +805,18 @@ def process_with_groq(user_input, system_message):
         l_assistant_response = final_response.choices[0].message.content
         
         final_assistant_response = replace_link_placeholders(l_assistant_response, link_map)
+        
+        # Add "Usage" and "Benefits" only if products are recommended
+        if matching_parents and contains_product_recommendations(final_assistant_response):
+            usage_and_benefits = "\n\nUsage:\n"
+            for parent in matching_parents:
+                usage_and_benefits += f"- {parent.get('Usage', 'No usage info available')}\n"
+            
+            usage_and_benefits += "\nBenefits:\n"
+            for parent in matching_parents:
+                usage_and_benefits += f"- {parent.get('Benefits', 'No benefits info available')}\n"
+            
+            final_assistant_response += usage_and_benefits
         
         conversation_history.append({"role": "assistant", "content": final_assistant_response})
         # Add the raw LLM response to final_conversation_history
@@ -810,6 +829,7 @@ def process_with_groq(user_input, system_message):
         print(f"Error occurred. Total processing time: {total_end_time - total_start_time:.4f} seconds")
         raise Exception(f"Error: {str(e)}")
     
+
 def chat_endpoint(message):
     system_message = read_system_message("keys.txt")
     response = process_with_groq(message, system_message)
