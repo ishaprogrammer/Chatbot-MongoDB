@@ -1,13 +1,6 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from typing import Optional
-from fastapi.middleware.cors import CORSMiddleware  
-import uvicorn
-
 # ----------------- Imports -----------------
 import h5py
 from pymongo import MongoClient
-import random
 import numpy as np
 from rapidfuzz import process, fuzz
 from groq import Groq
@@ -17,6 +10,15 @@ from dotenv import load_dotenv
 from functools import lru_cache
 import time
 import re
+import PyPDF2
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
+import tempfile
+import uuid
+import shutil
 
 # ----------------- Global Variables and Initializations -----------------
 load_dotenv()
@@ -32,52 +34,163 @@ client = MongoClient(os.getenv("MONGODB_URI"))
 db_health = client["ChatBot"]
 collection = db_health["children"]
 
-#------------------FastAPI setup--------------------------------
 
-# Define FastAPI app
-app = FastAPI()
+#-----------------------------------------------------FastAPI app------------------------------------------------
+ 
+app = FastAPI(title="Health Advisor API")
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins (replace with specific origins in production)
-    allow_credentials=True,  # Allows cookies and credentials
-    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
 
-# Define request and response models
-class QueryRequest(BaseModel):
+# Session storage (in-memory for this example)
+sessions = {}
+
+class ChatRequest(BaseModel):
     query: str
     session_id: Optional[str] = None
 
-class QueryResponse(BaseModel):
-    response: str
+class ChatResponse(BaseModel):
+    message: str
     session_id: str
+    expecting_upload: bool = False
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    query = request.query
+    session_id = request.session_id or str(uuid.uuid4())
     
-@app.get("/")
-async def root():
-    return {"message": "Health Chatbot API is running. Send POST requests to /chat endpoint."}
+    # Initialize session if it doesn't exist
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "initial_question_answered": False,
+            "expecting_upload": False
+        }
+    
+    session = sessions[session_id]
+    
+    # Handle exit command
+    if query.lower() in ["exit", "quit"]:
+        return ChatResponse(message="Goodbye!", session_id=session_id)
+    
+    # Handle the initial question if not yet answered
+    if not session["initial_question_answered"]:
+        if query.lower() == "continue":
+            session["initial_question_answered"] = True
+            return ChatResponse(
+                message="How can I help you today?",
+                session_id=session_id
+            )
+        elif query.lower() == "upload" or contains_upload_request(query):
+            session["expecting_upload"] = True
+            return ChatResponse(
+                message="Please upload your PDF",
+                session_id=session_id,
+                expecting_upload=True
+            )
+        else:
+            # If they didn't say continue or upload, treat it as continue
+            session["initial_question_answered"] = True
+            response = process_user_input(query, session_id)
+            return ChatResponse(
+                message=f"I'll proceed without health reports. {response}",
+                session_id=session_id
+            )
+    
+    # For subsequent queries, check if they want to upload a file anytime
+    if contains_upload_request(query) and not session["expecting_upload"]:
+        session["expecting_upload"] = True
+        return ChatResponse(
+            message="Please upload your PDF",
+            session_id=session_id,
+            expecting_upload=True
+        )
+    else:
+        # Regular query processing
+        response = process_user_input(query, session_id)
+        return ChatResponse(
+            message=response,
+            session_id=session_id
+        )
 
-# Define the /chat endpoint
-@app.post("/chat", response_model=QueryResponse)
-async def chat(request: QueryRequest):
-    """
-    Endpoint to handle user queries.
-    """
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    session_id: str = Form(...)
+):
+    # Initialize session if it doesn't exist - fix for the invalid session ID error
+    if session_id not in sessions:
+        sessions[session_id] = {
+            "initial_question_answered": False,
+            "expecting_upload": False
+        }
+    
+    if not file.filename.lower().endswith('.pdf'):
+        return JSONResponse(
+            status_code=400,
+            content={"message": "The uploaded file is not a PDF", "session_id": session_id}
+        )
+    
     try:
-        # Use the provided session_id or default to "default_session" if not provided
-        session_id = request.session_id if request.session_id else "default_session"
-
-        # Process the user input using the existing logic
-        response = process_user_input(request.query, session_id)
-
-        # Return the response along with the session_id
-        return QueryResponse(response=response, session_id=session_id)
+        # Create a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            # Copy uploaded file to the temporary file
+            shutil.copyfileobj(file.file, temp_file)
+            temp_path = temp_file.name
+        
+        # Process the PDF
+        response = handle_pdf_upload(temp_path)
+        
+        # Clean up the temporary file
+        os.unlink(temp_path)
+        
+        # Update session state
+        sessions[session_id]["expecting_upload"] = False
+        sessions[session_id]["initial_question_answered"] = True
+        
+        return JSONResponse(
+            content={"message": response, "session_id": session_id}
+        )
+    
     except Exception as e:
-        # Handle any errors and return a 500 status code with the error message
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={"message": f"An error occurred: {str(e)}", "session_id": session_id}
+        )
 
+@app.get("/start")
+async def start_session():
+    session_id = str(uuid.uuid4())
+    sessions[session_id] = {
+        "initial_question_answered": False,
+        "expecting_upload": False
+    }
+    
+    initial_question = start_chat()
+    return JSONResponse(
+        content={
+            "message": initial_question,
+            "session_id": session_id
+        }
+    )
+    
+@app.post("/clear")
+async def clear_chat(session_id: str = Form(...)):
+    if session_id in sessions:
+        del sessions[session_id]
+        return JSONResponse(
+            content={"message": "Chat session cleared successfully.", "session_id": session_id}
+        )
+    return JSONResponse(
+        content={"message": "Session ID not found.", "session_id": session_id},
+        status_code=404
+    )
+        
 # ----------------- Health Issue Code Functions -----------------
 def load_recommendations_from_h5(file_path):
     """Load health recommendations from HDF5 file"""
@@ -119,6 +232,7 @@ def preload_all_product_details():
             {"Product Title": 1, "Price": 1, "Size": 1, "Link": 1, "Link_value": 1, "_id": 0}
         ))
         product_cache[parent_id] = products
+        # print(f"Parent_id: {parent_id}, Products found: {len(products)}")
     return product_cache
 
  
@@ -157,12 +271,13 @@ def determine_filter_info(user_input):
 
 def fetch_product_details(parent_ids, product_cache):
     """Get product details from the preloaded cache"""
+    # print(f"Attempting to fetch details for these parent_ids: {parent_ids}")
+
     product_details = {}
     for parent_id in parent_ids:
         products = product_cache.get(parent_id, [])
         if products:
-            # Randomly select 2 products (or fewer if there aren't enough)
-            selected_products = random.sample(products, min(2, len(products)))
+            selected_products = [products[0]]
             product_details[parent_id] = [
                 {
                     "Product Title": product["Product Title"],
@@ -178,8 +293,6 @@ def fetch_product_details(parent_ids, product_cache):
             product_details[parent_id] = []  # No products found for this Parent_id
     return product_details
 
-
- 
 def get_millet_name_from_id(parent_id):
     """Convert parent_id to millet name"""
     id_to_name = {
@@ -321,7 +434,7 @@ def send_to_groq(content):
     
     return response.choices[0].message.content.strip()
 
- 
+
 def replace_links_with_details(llm_response, product_details):
     """Replace link placeholders with detailed product information"""
     # First, remove any ID patterns like (BROWNTOPMILLET001) that might appear
@@ -334,6 +447,7 @@ def replace_links_with_details(llm_response, product_details):
             # Format product details including Link_value
             formatted_details = f"{product['Product Title']}\n Price: ₹{product['Price']} for {product['Size']} [{product['Link_value']}]\n"
             
+            
             # Replace the Link with formatted details
             llm_response = llm_response.replace(product["Link"], formatted_details)
             
@@ -342,6 +456,11 @@ def replace_links_with_details(llm_response, product_details):
     # Clean up any formatting issues
     llm_response = llm_response.replace("  ", " ")
     llm_response = llm_response.replace("\n\n-", "\n-")
+    
+     # Add usage and benefits information at the end, only if products were recommended
+    if any(products for _, products in product_details.items()):
+        llm_response += "\n\nUsage:\n- Eat for breakfast or snacks. Cook like rice or make porridge, upma, or rotis.\n\n"
+        llm_response += "Benefits:\n- Rich in protein, boosts energy, and supports digestion."
     
     return llm_response
 
@@ -354,7 +473,7 @@ def get_session_memory(session_id):
         }
     return session_memory[session_id]
 
- 
+
 def update_session_memory(session_id, user_input, bot_response, health_issue=None):
     """Update session memory with new interaction"""
     session = get_session_memory(session_id)
@@ -772,6 +891,7 @@ def process_with_groq(user_input, system_message):
             Only use "₹" sign for prices.
             If user talks in Hindi, respond in Hindi but in English script.
             Do not create your own links, just provide link from the data.
+            Recommend products only from the database.
             Recommend min 1 and max 3 products from the provided data(if provided otherwise dont recommend any product).
             Response should be to the point and concise, also don't mention unnecessary info or comments.
             Please analyze the product information and provide clear recommendations in a proper format including:
@@ -808,15 +928,16 @@ def process_with_groq(user_input, system_message):
         
         # Add "Usage" and "Benefits" only if products are recommended
         if matching_parents and contains_product_recommendations(final_assistant_response):
-            usage_and_benefits = "\n\nUsage:\n"
-            for parent in matching_parents:
-                usage_and_benefits += f"- {parent.get('Usage', 'No usage info available')}\n"
-            
-            usage_and_benefits += "\nBenefits:\n"
-            for parent in matching_parents:
-                usage_and_benefits += f"- {parent.get('Benefits', 'No benefits info available')}\n"
-            
-            final_assistant_response += usage_and_benefits
+            # Only use the first matching parent for usage and benefits
+            if matching_parents:
+                first_parent = matching_parents[0]
+                usage_and_benefits = "\n\nUsage:\n"
+                usage_and_benefits += f"- {first_parent.get('Usage', 'No usage info available')}\n"
+                
+                usage_and_benefits += "\nBenefits:\n"
+                usage_and_benefits += f"- {first_parent.get('Benefits', 'No benefits info available')}\n"
+                
+                final_assistant_response += usage_and_benefits
         
         conversation_history.append({"role": "assistant", "content": final_assistant_response})
         # Add the raw LLM response to final_conversation_history
@@ -839,6 +960,7 @@ recommendations = load_recommendations_from_h5('recommendations.h5')
 product_cache = preload_all_product_details()
 load_all_data()
 # ----------------- Routing Logic -----------------
+
 def detect_health_keywords(user_input):
     """Detect health-related keywords or remedy keywords in the user's input."""
     input_lower = user_input.lower()
@@ -895,7 +1017,205 @@ def process_user_input(user_input, session_id):
         system_message = read_system_message("keys.txt")
         return process_with_groq(user_input, system_message)
 
+# Replace werkzeug's secure_filename with our own implementation
+def secure_filename(filename):
+    """
+    Create a secure version of a filename, removing potentially dangerous characters.
+    """
+    # Remove any path components and keep only the filename
+    filename = os.path.basename(filename)
+    
+    # Replace spaces with underscores and remove other problematic characters
+    filename = re.sub(r'[^\w\.-]', '_', filename)
+    
+    # Ensure filename isn't empty after sanitization
+    if not filename:
+        filename = 'unnamed_file'
+        
+    return filename
+
+def process_pdf_content(pdf_path):
+    """
+    Process PDF content to determine which code path to take.
+    Reuses existing detect_health_keywords and check_specific_health_issue functions.
+    """
+    try:
+        # Open the PDF file
+        with open(pdf_path, 'rb') as file:
+            # Create PDF reader object
+            reader = PyPDF2.PdfReader(file)
+            
+            # Extract text from all pages
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text()
+            
+            # Use existing functions to check for health issues
+            has_specific_issue, issue = check_specific_health_issue(text)
+            
+            if has_specific_issue:
+                # If a specific health issue is found, use health code
+                return True, issue
+            elif detect_health_keywords(text):
+                # If general health keywords are found, still use health code
+                return True, "health concern"
+            else:
+                # Otherwise use general code
+                return False, None
+            
+    except Exception as e:
+        print(f"Error processing PDF: {e}")
+        return False, None
+
+def handle_pdf_upload(file_path):
+    """
+    Process a PDF file and call the appropriate existing function
+    based on the detected content.
+    """
+    # Create a temp directory if it doesn't exist
+    temp_dir = os.path.join(os.getcwd(), "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Create a copy of the file with a secure name
+    filename = secure_filename(os.path.basename(file_path))
+    temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{filename}")
+    
+    try:
+        # Copy the file to temp location
+        shutil.copy(file_path, temp_path)
+        
+        # Process the PDF and determine code path
+        use_health_code, keyword = process_pdf_content(temp_path)
+        
+        # Generate appropriate response using existing functions
+        session_id = "pdf_session"
+        
+        if use_health_code:
+            print(f"Using health issue code for keyword: {keyword}")
+            if keyword and keyword != "health concern":
+                user_input = f"I have {keyword}. What products do you recommend?"
+            else:
+                user_input = "I have health concerns. What products do you recommend?"
+            
+            # Use your existing health code function
+            response = process_input_with_memory(user_input, session_id, product_cache)
+        else:
+            print(f"Using general code path")
+            user_input = "What general health products do you recommend?"
+            
+            # Use your existing general code function
+            system_message = read_system_message("keys.txt")
+            response = process_with_groq(user_input, system_message)
+            
+        # Clean up the temporary file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            
+        return "Based on your reports, here are some diet tips.\n\n" + response        
+    
+    except Exception as e:
+        # Clean up on error
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return f"There was an error processing your PDF: {str(e)}"
+
+def start_chat():
+    """
+    Start a new chat session with the initial question about health reports.
+    """
+    return " Tell me about your health concern! Would you like to upload your health reports for better recommendations or would you like to continue without health reports? Type \"continue\" to continue without reports or Type \"upload\" to upload your reports."
+
+def contains_upload_request(query):
+    """
+    Check if the query contains any form of upload request.
+    """
+    upload_patterns = [
+        r'\bupload\b', 
+        r'\bupload.+pdf\b', 
+        r'\bupload.+report\b',
+        r'\bupload.+file\b',
+        r'\bshare.+pdf\b',
+        r'\bshare.+report\b',
+        r'\bsend.+pdf\b',
+        r'\bsend.+report\b',
+        r'\battach.+pdf\b',
+        r'\battach.+report\b'
+    ]
+    
+    query_lower = query.lower()
+    return any(re.search(pattern, query_lower) for pattern in upload_patterns)
+
+# Function to open file dialog using different methods
+def open_file_dialog():
+    """
+    Opens the native system file dialog to select a PDF file.
+    Tries multiple methods to ensure compatibility.
+    Returns the selected file path or None if canceled.
+    """
+    # First, try using tkinter if available
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        
+        print("Opening file dialog using tkinter...")
+        
+        # Hide the main tkinter window
+        root = tk.Tk()
+        root.withdraw()
+        
+        # Make sure the dialog appears on top
+        root.attributes('-topmost', True)
+        
+        # Open the file dialog
+        file_path = filedialog.askopenfilename(
+            title="Select PDF File",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
+        )
+        
+        # Close the tkinter instance
+        root.destroy()
+        
+        if file_path:
+            return file_path
+        else:
+            print("No file selected or dialog was cancelled.")
+            return None
+            
+    except Exception as e:
+        print(f"Error with tkinter file dialog: {e}")
+        
+    # If tkinter fails, try PySimpleGUI
+    try:
+        import PySimpleGUI as sg
+        
+        print("Opening file dialog using PySimpleGUI...")
+        
+        file_path = sg.popup_get_file(
+            'Select PDF File', 
+            file_types=(("PDF Files", "*.pdf"), ("All Files", "*.*")),
+            no_window=True
+        )
+        
+        if file_path:
+            return file_path
+        else:
+            print("No file selected or dialog was cancelled.")
+            return None
+            
+    except Exception as e:
+        print(f"Error with PySimpleGUI file dialog: {e}")
+    
+    # If both GUI methods fail, let the user type the path
+    print("\nUnable to open file dialog. Please manually enter the full path to your PDF file:")
+    file_path = input("> ")
+    
+    if os.path.exists(file_path) and file_path.lower().endswith('.pdf'):
+        return file_path
+    else:
+        print("Invalid file path or not a PDF file.")
+        return None
+
 # ----------------- Main Loop -----------------
-# Run the FastAPI app
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
