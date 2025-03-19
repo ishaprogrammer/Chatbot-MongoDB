@@ -138,7 +138,7 @@ async def upload_file(
     
     try:
         # Create a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+        with tempfile.NamedTemporaryFile(dir="/tmp", delete=False, suffix='.pdf') as temp_file:
             # Copy uploaded file to the temporary file
             shutil.copyfileobj(file.file, temp_file)
             temp_path = temp_file.name
