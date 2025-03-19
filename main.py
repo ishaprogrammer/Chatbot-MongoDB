@@ -1,3 +1,4 @@
+#Deployed on 3/19/25
 # ----------------- Imports -----------------
 import h5py
 from pymongo import MongoClient
@@ -35,7 +36,7 @@ db_health = client["ChatBot"]
 collection = db_health["children"]
 
 
-#-----------------------------------------------------FastAPI app------------------------------------------------
+#-----------------------------------------------------FastAPI App-----------------------------------------------
  
 app = FastAPI(title="Health Advisor API")
 
@@ -123,7 +124,7 @@ async def upload_file(
     file: UploadFile = File(...),
     session_id: str = Form(...)
 ):
-    # Initialize session if it doesn't exist - fix for the invalid session ID error
+    # Initialize session if it doesn't exist
     if session_id not in sessions:
         sessions[session_id] = {
             "initial_question_answered": False,
@@ -137,17 +138,14 @@ async def upload_file(
         )
     
     try:
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(dir="/tmp", delete=False, suffix='.pdf') as temp_file:
-            # Copy uploaded file to the temporary file
-            shutil.copyfileobj(file.file, temp_file)
-            temp_path = temp_file.name
+        # Read the file content into memory
+        file_content = await file.read()
         
-        # Process the PDF
-        response = handle_pdf_upload(temp_path)
+        # Create a file-like object from the content
+        pdf_file = io.BytesIO(file_content)
         
-        # Clean up the temporary file
-        os.unlink(temp_path)
+        # Process the PDF in memory
+        response = handle_pdf_upload(pdf_file)
         
         # Update session state
         sessions[session_id]["expecting_upload"] = False
@@ -1067,25 +1065,25 @@ def process_pdf_content(pdf_path):
         print(f"Error processing PDF: {e}")
         return False, None
 
-def handle_pdf_upload(file_path):
+import io
+from PyPDF2 import PdfReader
+
+def handle_pdf_upload(file_object):
     """
     Process a PDF file and call the appropriate existing function
-    based on the detected content.
+    based on the detected content. This version works in memory.
     """
-    # Create a temp directory if it doesn't exist
-    temp_dir = os.path.join(os.getcwd(), "temp")
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Create a copy of the file with a secure name
-    filename = secure_filename(os.path.basename(file_path))
-    temp_path = os.path.join(temp_dir, f"{uuid.uuid4().hex}_{filename}")
-    
     try:
-        # Copy the file to temp location
-        shutil.copy(file_path, temp_path)
+        # Read the PDF content directly from the file-like object
+        reader = PdfReader(file_object)
         
-        # Process the PDF and determine code path
-        use_health_code, keyword = process_pdf_content(temp_path)
+        # Extract text from the PDF
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text()
+        
+        # Process the extracted text to determine code path
+        use_health_code, keyword = process_pdf_content_from_text(text)
         
         # Generate appropriate response using existing functions
         session_id = "pdf_session"
@@ -1107,17 +1105,29 @@ def handle_pdf_upload(file_path):
             system_message = read_system_message("keys.txt")
             response = process_with_groq(user_input, system_message)
             
-        # Clean up the temporary file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            
         return "Based on your reports, here are some diet tips.\n\n" + response        
     
     except Exception as e:
-        # Clean up on error
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
         return f"There was an error processing your PDF: {str(e)}"
+    
+def process_pdf_content_from_text(text: str):
+    """
+    Process the extracted text from the PDF to determine the code path.
+    Replace this with your actual logic for detecting health issues or keywords.
+    """
+    # Example: Check for specific keywords in the text
+    health_keywords = health_issues
+    use_health_code = False
+    keyword = None
+    
+    for word in health_keywords:
+        if word in text.lower():
+            use_health_code = True
+            keyword = word
+            break
+    
+    return use_health_code, keyword
+
 
 def start_chat():
     """
