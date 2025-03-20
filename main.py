@@ -1,4 +1,4 @@
-#Deployed on 3/19/25
+#Deployed on 3/20/25
 # ----------------- Imports -----------------
 import h5py
 from pymongo import MongoClient
@@ -12,14 +12,12 @@ from functools import lru_cache
 import time
 import re
 import PyPDF2
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-import tempfile
-import uuid
-import shutil
+import io
 
 # ----------------- Global Variables and Initializations -----------------
 load_dotenv()
@@ -49,12 +47,14 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+
 # Session storage (in-memory for this example)
 sessions = {}
 
 class ChatRequest(BaseModel):
-    query: str
+    query: Optional[str] = None
     session_id: Optional[str] = None
+    file: Optional[UploadFile] = None
 
 class ChatResponse(BaseModel):
     message: str
@@ -62,32 +62,88 @@ class ChatResponse(BaseModel):
     expecting_upload: bool = False
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    query = request.query
-    session_id = request.session_id or str(uuid.uuid4())
-    
+async def chat(
+    query: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    session_id: str = Form(...)  # Require session_id from the frontend
+):
     # Initialize session if it doesn't exist
     if session_id not in sessions:
         sessions[session_id] = {
             "initial_question_answered": False,
-            "expecting_upload": False
+            "expecting_upload": False,
+            "pdf_processed": False
         }
     
     session = sessions[session_id]
     
-    # Handle exit command
-    if query.lower() in ["exit", "quit"]:
-        return ChatResponse(message="Goodbye!", session_id=session_id)
-    
-    # Handle the initial question if not yet answered
-    if not session["initial_question_answered"]:
-        if query.lower() == "continue":
+    # Handle file upload if provided
+    if file:
+        if not file.filename.lower().endswith('.pdf'):
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a PDF"
+            )
+        
+        try:
+            # Read the file content into memory
+            file_content = await file.read()
+            
+            # Create a file-like object from the content
+            pdf_file = io.BytesIO(file_content)
+            
+            # Process the PDF in memory
+            pdf_response = handle_pdf_upload(pdf_file)
+            
+            # Update session state
+            session["expecting_upload"] = False
             session["initial_question_answered"] = True
+            session["pdf_processed"] = True  # Set the PDF processed flag
+            
+            # Ignore text input if both file and text are provided
             return ChatResponse(
-                message="How can I help you today?",
+                message=pdf_response,
                 session_id=session_id
             )
-        elif query.lower() == "upload" or contains_upload_request(query):
+        
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"An error occurred: {str(e)}"
+            )
+    
+    # Handle text input if no file is uploaded
+    if query:
+        # Handle exit command
+        if query.lower() in ["exit", "quit"]:
+            return ChatResponse(message="Goodbye!", session_id=session_id)
+        
+        # Handle the initial question if not yet answered
+        if not session["initial_question_answered"]:
+            if query.lower() == "continue":
+                session["initial_question_answered"] = True
+                return ChatResponse(
+                    message="How can I help you today?",
+                    session_id=session_id
+                )
+            elif query.lower() == "upload" or contains_upload_request(query):
+                session["expecting_upload"] = True
+                return ChatResponse(
+                    message="Please upload your PDF",
+                    session_id=session_id,
+                    expecting_upload=True
+                )
+            else:
+                # If they didn't say continue or upload, treat it as continue
+                session["initial_question_answered"] = True
+                response = process_user_input(query, session_id)
+                return ChatResponse(
+                    message=f"I'll proceed without health reports. {response}",
+                    session_id=session_id
+                )
+        
+        # For subsequent queries, check if they want to upload a file anytime
+        if contains_upload_request(query) and not session["expecting_upload"]:
             session["expecting_upload"] = True
             return ChatResponse(
                 message="Please upload your PDF",
@@ -95,86 +151,17 @@ async def chat(request: ChatRequest):
                 expecting_upload=True
             )
         else:
-            # If they didn't say continue or upload, treat it as continue
-            session["initial_question_answered"] = True
+            # Regular query processing
             response = process_user_input(query, session_id)
             return ChatResponse(
-                message=f"I'll proceed without health reports. {response}",
+                message=response,
                 session_id=session_id
             )
     
-    # For subsequent queries, check if they want to upload a file anytime
-    if contains_upload_request(query) and not session["expecting_upload"]:
-        session["expecting_upload"] = True
-        return ChatResponse(
-            message="Please upload your PDF",
-            session_id=session_id,
-            expecting_upload=True
-        )
-    else:
-        # Regular query processing
-        response = process_user_input(query, session_id)
-        return ChatResponse(
-            message=response,
-            session_id=session_id
-        )
-
-@app.post("/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    session_id: str = Form(...)
-):
-    # Initialize session if it doesn't exist
-    if session_id not in sessions:
-        sessions[session_id] = {
-            "initial_question_answered": False,
-            "expecting_upload": False
-        }
-    
-    if not file.filename.lower().endswith('.pdf'):
-        return JSONResponse(
-            status_code=400,
-            content={"message": "The uploaded file is not a PDF", "session_id": session_id}
-        )
-    
-    try:
-        # Read the file content into memory
-        file_content = await file.read()
-        
-        # Create a file-like object from the content
-        pdf_file = io.BytesIO(file_content)
-        
-        # Process the PDF in memory
-        response = handle_pdf_upload(pdf_file)
-        
-        # Update session state
-        sessions[session_id]["expecting_upload"] = False
-        sessions[session_id]["initial_question_answered"] = True
-        
-        return JSONResponse(
-            content={"message": response, "session_id": session_id}
-        )
-    
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"message": f"An error occurred: {str(e)}", "session_id": session_id}
-        )
-
-@app.get("/start")
-async def start_session():
-    session_id = str(uuid.uuid4())
-    sessions[session_id] = {
-        "initial_question_answered": False,
-        "expecting_upload": False
-    }
-    
-    initial_question = start_chat()
-    return JSONResponse(
-        content={
-            "message": initial_question,
-            "session_id": session_id
-        }
+    # If neither file nor text input is provided
+    raise HTTPException(
+        status_code=400,
+        detail="No file or text input provided"
     )
     
 @app.post("/clear")
