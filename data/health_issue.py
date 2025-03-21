@@ -228,14 +228,14 @@ def send_to_groq(content):
     # Initialize Groq client
     groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
     
-    # Define the prompt for Groq
+     # Define the prompt for Groq
     prompt = f"""Based on the following information, generate a concise and helpful response. For recommended products.
     Use numbered list format for the millet types, with each millet on its own line followed by a colon.
-    Do not generate Product Title, Price, Size, Link_value, or any additional links, URLs or information. Use only the information provided.
-    Do not include any parent_id.    
+    Do not include any parent_id.
+    Do not remove any information.
     Here is the information:
     {content}
-    """     
+    """      
 
     # Call Groq API
     response = groq_client.chat.completions.create(
@@ -245,7 +245,7 @@ def send_to_groq(content):
                 "content": prompt,
             }
         ],
-        model="mixtral-8x7b-32768",
+        model="llama-3.3-70b-specdec",
         max_tokens=500,
         temperature=0.7,
     )
